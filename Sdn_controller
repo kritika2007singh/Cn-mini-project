@@ -1,0 +1,459 @@
+
+# ------------------------------------------------------
+# ADAPTIVE LOAD BALANCER
+# RYU SDN CONTROLLER
+# PERSON 2
+# ------------------------------------------------------
+
+import os
+import json
+import socket
+
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import (
+    CONFIG_DISPATCHER,
+    MAIN_DISPATCHER,
+    DEAD_DISPATCHER,
+    set_ev_cls
+)
+
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib import hub
+
+from ryu.lib.packet import (
+    packet,
+    ethernet,
+    ether_types,
+    arp,
+    ipv4
+)
+
+
+# ------------------------------------------------------
+# NETWORK CONFIGURATION
+# ------------------------------------------------------
+
+LB_IP = "10.0.0.4"
+
+BACKEND_SERVERS = [
+    "10.0.0.11",
+    "10.0.0.12",
+    "10.0.0.13"
+]
+
+BACKEND_PORT = 6000
+
+SOCKET_PATH = "/tmp/ryu_backend.sock"
+
+
+# ------------------------------------------------------
+# RYU CONTROLLER CLASS
+# ------------------------------------------------------
+
+class AdaptiveLoadBalancerController(app_manager.RyuApp):
+
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def __init__(self, *args, **kwargs):
+
+        super(AdaptiveLoadBalancerController, self).__init__(
+            *args, **kwargs
+        )
+
+        self.datapaths = {}
+
+        self.mac_to_port = {}
+
+        self.ip_to_port = {}
+
+        self.socket_thread = hub.spawn(
+            self.start_socket_server
+        )
+
+        self.logger.info(
+            "Adaptive Load Balancer Controller Started"
+        )
+
+
+    # --------------------------------------------------
+    # 1. TRACK SWITCH CONNECTIONS
+    # --------------------------------------------------
+
+    @set_ev_cls(
+        ofp_event.EventOFPStateChange,
+        [MAIN_DISPATCHER, DEAD_DISPATCHER]
+    )
+
+    def switch_state_change(self, ev):
+
+        datapath = ev.datapath
+
+        if ev.state == MAIN_DISPATCHER:
+
+            self.datapaths[datapath.id] = datapath
+
+            self.logger.info(
+                "Switch connected: %s",
+                datapath.id
+            )
+
+        elif ev.state == DEAD_DISPATCHER:
+
+            if datapath.id in self.datapaths:
+
+                del self.datapaths[datapath.id]
+
+                self.logger.info(
+                    "Switch disconnected: %s",
+                    datapath.id
+                )
+
+
+    # --------------------------------------------------
+    # 2. INSTALL TABLE-MISS FLOW
+    # --------------------------------------------------
+
+    @set_ev_cls(
+        ofp_event.EventOFPSwitchFeatures,
+        CONFIG_DISPATCHER
+    )
+
+    def switch_features_handler(self, ev):
+
+        datapath = ev.msg.datapath
+
+        self.datapaths[datapath.id] = datapath
+
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        match = parser.OFPMatch()
+
+        actions = [
+            parser.OFPActionOutput(
+                ofproto.OFPP_CONTROLLER,
+                ofproto.OFPCML_NO_BUFFER
+            )
+        ]
+
+        self.add_flow(
+            datapath,
+            priority=0,
+            match=match,
+            actions=actions
+        )
+
+        self.logger.info(
+            "Table-miss flow installed on switch %s",
+            datapath.id
+        )
+
+
+    # --------------------------------------------------
+    # 3. ADD FLOW RULE TO SWITCH
+    # --------------------------------------------------
+
+    def add_flow(
+        self,
+        datapath,
+        priority,
+        match,
+        actions,
+        idle_timeout=0
+    ):
+
+        parser = datapath.ofproto_parser
+
+        ofproto = datapath.ofproto
+
+        instructions = [
+            parser.OFPInstructionActions(
+                ofproto.OFPIT_APPLY_ACTIONS,
+                actions
+            )
+        ]
+
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=match,
+            instructions=instructions,
+            idle_timeout=idle_timeout
+        )
+
+        datapath.send_msg(mod)
+
+
+    # --------------------------------------------------
+    # 4. LEARN HOST INFORMATION
+    # --------------------------------------------------
+
+    def learn_host(self, datapath, src_mac, src_ip, in_port):
+
+        dpid = datapath.id
+
+        if dpid not in self.mac_to_port:
+
+            self.mac_to_port[dpid] = {}
+
+        self.mac_to_port[dpid][src_mac] = in_port
+
+        if src_ip:
+
+            self.ip_to_port[src_ip] = (
+                datapath,
+                in_port
+            )
+
+            self.logger.info(
+                "Learned host IP %s on port %s",
+                src_ip,
+                in_port
+            )
+
+
+    # --------------------------------------------------
+    # 5. INSTALL BACKEND FORWARDING RULE
+    # --------------------------------------------------
+
+    def install_backend_flow(self, backend_ip):
+
+        if backend_ip not in BACKEND_SERVERS:
+
+            self.logger.error(
+                "Invalid backend IP: %s",
+                backend_ip
+            )
+
+            return False
+
+        if backend_ip not in self.ip_to_port:
+
+            self.logger.warning(
+                "Backend %s has not been learned yet",
+                backend_ip
+            )
+
+            return False
+
+        datapath, backend_port = self.ip_to_port[backend_ip]
+
+        parser = datapath.ofproto_parser
+
+        match = parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_IP,
+            ipv4_src=LB_IP,
+            ipv4_dst=backend_ip,
+            ip_proto=6,
+            tcp_dst=BACKEND_PORT
+        )
+
+        actions = [
+            parser.OFPActionOutput(backend_port)
+        ]
+
+        self.add_flow(
+            datapath,
+            priority=20,
+            match=match,
+            actions=actions,
+            idle_timeout=300
+        )
+
+        self.logger.info(
+            "Installed backend flow: %s -> %s through port %s",
+            LB_IP,
+            backend_ip,
+            backend_port
+        )
+
+        return True
+
+
+    # --------------------------------------------------
+    # 6. UNIX SOCKET SERVER
+    # --------------------------------------------------
+
+    def start_socket_server(self):
+
+        if os.path.exists(SOCKET_PATH):
+
+            os.remove(SOCKET_PATH)
+
+        server = socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM
+        )
+
+        server.bind(SOCKET_PATH)
+
+        server.listen(5)
+
+        self.logger.info(
+            "Backend selection socket listening at %s",
+            SOCKET_PATH
+        )
+
+        while True:
+
+            conn, address = server.accept()
+
+            try:
+
+                data = b""
+
+                while not data.endswith(b"\n"):
+
+                    chunk = conn.recv(4096)
+
+                    if not chunk:
+                        break
+
+                    data += chunk
+
+                if not data:
+
+                    continue
+
+                message = json.loads(
+                    data.decode("utf-8")
+                )
+
+                backend_ip = message.get(
+                    "backend_ip"
+                )
+
+                self.logger.info(
+                    "Received selected backend: %s",
+                    backend_ip
+                )
+
+                success = self.install_backend_flow(
+                    backend_ip
+                )
+
+                response = {
+                    "success": success,
+                    "backend_ip": backend_ip
+                }
+
+                conn.sendall(
+                    (
+                        json.dumps(response) + "\n"
+                    ).encode("utf-8")
+                )
+
+            except Exception as error:
+
+                self.logger.error(
+                    "Socket processing error: %s",
+                    error
+                )
+
+            finally:
+
+                conn.close()
+
+
+    # --------------------------------------------------
+    # 7. LEARNING SWITCH PACKET HANDLER
+    # --------------------------------------------------
+
+    @set_ev_cls(
+        ofp_event.EventOFPPacketIn,
+        MAIN_DISPATCHER
+    )
+
+    def packet_in_handler(self, ev):
+
+        msg = ev.msg
+
+        datapath = msg.datapath
+
+        parser = datapath.ofproto_parser
+
+        ofproto = datapath.ofproto
+
+        in_port = msg.match["in_port"]
+
+        pkt = packet.Packet(msg.data)
+
+        eth = pkt.get_protocol(
+            ethernet.ethernet
+        )
+
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+
+            return
+
+        src_mac = eth.src
+
+        dst_mac = eth.dst
+
+        src_ip = None
+
+        arp_pkt = pkt.get_protocol(arp.arp)
+
+        if arp_pkt:
+
+            src_ip = arp_pkt.src_ip
+
+        ipv4_pkt = pkt.get_protocol(ipv4.ipv4)
+
+        if ipv4_pkt:
+
+            src_ip = ipv4_pkt.src
+
+        self.learn_host(
+            datapath,
+            src_mac,
+            src_ip,
+            in_port
+        )
+
+        dpid = datapath.id
+
+        if dst_mac in self.mac_to_port[dpid]:
+
+            out_port = self.mac_to_port[dpid][dst_mac]
+
+        else:
+
+            out_port = ofproto.OFPP_FLOOD
+
+        actions = [
+            parser.OFPActionOutput(out_port)
+        ]
+
+        if out_port != ofproto.OFPP_FLOOD:
+
+            match = parser.OFPMatch(
+                in_port=in_port,
+                eth_src=src_mac,
+                eth_dst=dst_mac
+            )
+
+            self.add_flow(
+                datapath,
+                priority=1,
+                match=match,
+                actions=actions,
+                idle_timeout=300
+            )
+
+        data = None
+
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+
+            data = msg.data
+
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data
+        )
+
+        datapath.send_msg(out)
