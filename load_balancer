@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""load_balancer.py -- Person 4: TCP load balancer (static + adaptive).
+
+A transparent TCP proxy. Clients connect to the load balancer (default
+10.0.0.4:5000); for every new connection it picks a backend server
+(10.0.0.11/12/13:6000), tells the SDN controller which backend was chosen,
+connects to it and relays bytes both ways. Because it only relays bytes it does
+not depend on the request/response format used by Person 3's clients/servers.
+
+Modes (same code, same logs, only the selection rule differs):
+  static   : round-robin over servers that are not down.
+  adaptive : lowest load score among servers that are up and not overloaded.
+
+Adaptive score (0..1, lower is better), see SCORE section below:
+  0.35 * connections   active + reserved (picked but not yet connected)
+  0.25 * latency       moving average of time-to-first-byte seen by the LB
+  0.20 * traffic       recent bytes/s relayed to that backend
+  0.20 * health        health-check round-trip time
+
+Health checks: every second a probe connects to each backend, sends STATUS and
+reads the reply. 3 failed probes -> down. A refused/timed-out connect while
+proxying marks the server down immediately and the request is retried on
+another server. 2 good probes -> up again.
+
+Overload: a server is overloaded when (active + reserved) >= --overload-conns
+or its score >= 0.80. It stays excluded until it falls below 70% of the
+connection limit AND its score is <= 0.60 (hysteresis, avoids flapping). If all
+servers are overloaded the least-loaded one is still used.
+
+Controller notification: one JSON line over UDP per selection, e.g.
+  {"type":"backend_selected","ts":1730550000.1,"mode":"adaptive",
+   "lb_ip":"10.0.0.4","client_ip":"10.0.0.1","client_port":41234,
+   "backend":"server2","backend_ip":"10.0.0.12","backend_port":6000}
+
+Logs (in --log-dir, files prefixed lb_<mode>_<run-id>_):
+  decisions.csv     one row per selection (scores of every server at that time)
+  requests.csv      one row per proxied connection (connect/ttfb/duration/bytes)
+  events.csv        down / up / overload_on / overload_off / start / stop
+  network_load.csv  once per second: interface rx/tx rate, utilisation, per-
+                    backend traffic rate and active connections
+"""
+
+import argparse
+import csv
+import json
+import os
+import selectors
+import signal
+import socket
+import sys
+import threading
+import time
+
+try:
+    import resource
+except ImportError:          # not on Linux/Mac
+    resource = None
+
+DEFAULT_BACKENDS = ("server1=10.0.0.11:6000,server2=10.0.0.12:6000,"
+                    "server3=10.0.0.13:6000")
+REPORTED_KEYS = ("active_connections", "active_conns", "connections", "active")
+
+
+def clamp01(x):
+    return max(0.0, min(1.0, float(x)))
+
+
+class Settings:
+    """All tunable parameters in one place (document final values in report)."""
+
+    def __init__(self, **kw):
+        self.mode = "adaptive"
+        # scoring: each term is divided by its cap and clamped to 0..1
+        self.conn_cap = 30.0            # connections that count as "full"
+        self.lat_cap_ms = 300.0         # time-to-first-byte that counts as "full"
+        self.traffic_cap_bps = 2e6      # relayed bytes/s that counts as "full"
+        self.hc_rtt_cap_ms = 100.0      # health-check RTT that counts as "full"
+        self.weights = {"conns": 0.35, "latency": 0.25,
+                        "traffic": 0.20, "health": 0.20}
+        self.lat_decay = 0.9            # idle latency memory decay per second
+        # overload
+        self.overload_conns = 40
+        self.score_high = 0.80
+        self.score_low = 0.60
+        self.conn_low_ratio = 0.70
+        # health
+        self.health_interval = 1.0
+        self.health_timeout = 1.0
+        self.down_after = 3
+        self.up_after = 2
+        self.health_cmd = b"STATUS\n"
+        self.require_status_reply = False
+        # proxy
+        self.connect_timeout = 2.0
+        self.max_attempts = 3
+        self.idle_timeout = 30.0
+        # monitoring / outputs
+        self.iface = "auto"
+        self.link_mbps = 10.0
+        self.controller = None          # (host, port) or None
+        self.lb_ip = "10.0.0.4"
+        self.log_dir = "logs"
+        self.run_id = time.strftime("%Y%m%d-%H%M%S")
+        self.__dict__.update(kw)
+
+
+# ---------------------------------------------------------------------------
+# logging helpers
+# ---------------------------------------------------------------------------
+class NullLog:
+    def row(self, *vals):
+        pass
+
+    def close(self):
+        pass
+
+
+class CsvLog:
+    def __init__(self, path, header):
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        self._f = open(path, "w", newline="")
+        self._w = csv.writer(self._f)
+        self._lock = threading.Lock()
+        self._w.writerow(header)
+        self._f.flush()
+
+    def row(self, *vals):
+        with self._lock:
+            if self._f.closed:
+                return
+            self._w.writerow(vals)
+            self._f.flush()
+
+    def close(self):
+        with self._lock:
+            if not self._f.closed:
+                self._f.close()
+
+
+# ---------------------------------------------------------------------------
+# backend state
+# ---------------------------------------------------------------------------
+class Backend:
+    def __init__(self, name, host, port):
+        self.name, self.host, self.port = name, host, int(port)
+        self.state = "down"             # 'up' | 'down'; first probe decides
+        self.overloaded = False
+        self.active = 0                 # connections currently being relayed
+        self.reserved = 0               # chosen but not yet connected
+        self.reported_conns = None      # from the server's STATUS reply
+        self.hc_rtt_ms = 0.0
+        self.fail_streak = 0
+        self.ok_streak = 0
+        self.lat_ms = 0.0               # moving average of time-to-first-byte
+        self._lat_fresh = False
+        self.bytes = 0
+        self._last_bytes = 0
+        self.rate_bps = 0.0
+        self.served = 0
+        self.errors = 0
+
+    @property
+    def addr(self):
+        return (self.host, self.port)
+
+
+def parse_backends(spec):
+    out = []
+    for item in spec.split(","):
+        name, hp = item.strip().split("=")
+        host, port = hp.rsplit(":", 1)
+        out.append(Backend(name.strip(), host.strip(), int(port)))
+    if not out:
+        raise ValueError("no backends given")
+    return out
+
+
+def parse_reported(data):
+    """Extract an active-connection count from a STATUS reply, if present."""
+    try:
+        line = data.decode("utf-8", "replace").strip().splitlines()[0]
+        obj = json.loads(line)
+        if isinstance(obj, dict):
+            for k in REPORTED_KEYS:
+                if k in obj and isinstance(obj[k], (int, float)):
+                    return int(obj[k])
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# the decision logic
+# ---------------------------------------------------------------------------
+class Balancer:
+    """Thread-safe server selection + bookkeeping (no sockets in here)."""
+
+    def __init__(self, backends, settings, events=None):
+        self.backends = backends
+        self.s = settings
+        self.events = events or NullLog()
+        self.lock = threading.Lock()
+        self._rr = 0
+
+    # -- scoring -------------------------------------------------------
+    def load(self, b):
+        return max(b.active + b.reserved, b.reported_conns or 0)
+
+    def score(self, b):
+        s, w = self.s, self.s.weights
+        return (w["conns"] * clamp01(self.load(b) / s.conn_cap)
+                + w["latency"] * clamp01(b.lat_ms / s.lat_cap_ms)
+                + w["traffic"] * clamp01(b.rate_bps / s.traffic_cap_bps)
+                + w["health"] * clamp01(b.hc_rtt_ms / s.hc_rtt_cap_ms))
+
+    def _event(self, event, server, detail=""):
+        self.events.row(time.time(), event, server, detail)
+
+    def _update_overload(self, b, score):
+        s = self.s
+        load = self.load(b)
+        if b.overloaded:
+            if load <= s.overload_conns * s.conn_low_ratio and score <= s.score_low:
+                b.overloaded = False
+                self._event("overload_off", b.name, "load=%d score=%.2f" % (load, score))
+        elif load >= s.overload_conns or score >= s.score_high:
+            b.overloaded = True
+            self._event("overload_on", b.name, "load=%d score=%.2f" % (load, score))
+
+    # -- selection ----------------------------------------------------
+    def choose(self, exclude=()):
+        """Pick a backend and reserve a connection slot on it.
+
+        Returns (backend or None, info dict for the decision log)."""
+        with self.lock:
+            scores = {b.name: self.score(b) for b in self.backends}
+            for b in self.backends:
+                if b.state == "up":
+                    self._update_overload(b, scores[b.name])
+                else:
+                    b.overloaded = False
+            alive = [b for b in self.backends
+                     if b.state == "up" and b.name not in exclude]
+            snap = [dict(name=b.name, active=b.active, reserved=b.reserved,
+                         state=("overloaded" if b.overloaded and b.state == "up"
+                                else b.state),
+                         score=round(scores[b.name], 4)) for b in self.backends]
+            if not alive:
+                return None, dict(reason="no_backend_available", snapshot=snap)
+            if self.s.mode == "static":
+                chosen, reason = self._rr_pick(alive), "round_robin"
+            else:
+                pool = [b for b in alive if not b.overloaded]
+                reason = "min_score"
+                if not pool:
+                    pool, reason = alive, "all_overloaded_least_bad"
+                chosen = min(pool, key=lambda b: (scores[b.name], self.load(b), b.name))
+            chosen.reserved += 1
+            overloaded = ",".join(b.name for b in self.backends if b.overloaded)
+            return chosen, dict(reason=reason, snapshot=snap, overloaded=overloaded)
+
+    def _rr_pick(self, alive):
+        n = len(self.backends)
+        for i in range(n):
+            idx = (self._rr + i) % n
+            if self.backends[idx] in alive:
+                self._rr = (idx + 1) % n
+                return self.backends[idx]
+
+    # -- bookkeeping from the proxy ------------------------------------
+    def connected(self, b):
+        with self.lock:
+            b.reserved -= 1
+            b.active += 1
+
+    def connect_failed(self, b, err):
+        with self.lock:
+            b.reserved -= 1
+            b.errors += 1
+            b.ok_streak = 0
+            b.fail_streak = self.s.down_after
+            if b.state == "up":
+                b.state, b.overloaded = "down", False
+                self._event("down", b.name, "connect failed: %s" % err)
+
+    def finished(self, b, ttfb_ms, error=False):
+        with self.lock:
+            b.active -= 1
+            b.served += 1
+            if error:
+                b.errors += 1
+            if ttfb_ms is not None:
+                b.lat_ms = ttfb_ms if b.lat_ms == 0 else 0.7 * b.lat_ms + 0.3 * ttfb_ms
+                b._lat_fresh = True
+
+    def add_bytes(self, b, n):
+        with self.lock:
+            b.bytes += n
+
+    def sample_rates(self, dt):
+        """Called about once a second: traffic rate + idle latency decay."""
+        with self.lock:
+            for b in self.backends:
+                inst = (b.bytes - b._last_bytes) / max(dt, 1e-6)
+                b._last_bytes = b.bytes
+                b.rate_bps = 0.5 * b.rate_bps + 0.5 * inst
+                if b._lat_fresh:
+                    b._lat_fresh = False
+                else:               # no new observation: forget slowly so a
+                    b.lat_ms *= self.s.lat_decay   # slow server gets re-tested
+
+    # -- health ---------------------------------------------------------
+    def initial_state(self, b, ok, rtt_ms, reported):
+        with self.lock:
+            if ok:
+                b.state, b.hc_rtt_ms, b.reported_conns = "up", rtt_ms or 0.0, reported
+            self._event("start_up" if ok else "start_down", b.name, "")
+
+    def health_result(self, b, ok, rtt_ms, reported):
+        with self.lock:
+            if ok:
+                b.ok_streak += 1
+                b.fail_streak = 0
+                if rtt_ms is not None:
+                    b.hc_rtt_ms = rtt_ms if b.hc_rtt_ms == 0 else \
+                        0.5 * b.hc_rtt_ms + 0.5 * rtt_ms
+                b.reported_conns = reported
+                if b.state == "down" and b.ok_streak >= self.s.up_after:
+                    b.state = "up"
+                    self._event("up", b.name, "%d good health checks" % b.ok_streak)
+            else:
+                b.fail_streak += 1
+                b.ok_streak = 0
+                b.reported_conns = None
+                if b.state == "up" and b.fail_streak >= self.s.down_after:
+                    b.state, b.overloaded = "down", False
+                    self._event("down", b.name,
+                                "%d failed health checks" % b.fail_streak)
+
+
+# ---------------------------------------------------------------------------
+# health checker
+# ---------------------------------------------------------------------------
+class HealthChecker:
+    def __init__(self, bal, settings):
+        self.bal, self.s = bal, settings
+        self._stop = threading.Event()
+        self._threads = []
+
+    def probe(self, b):
+        """Returns (alive, rtt_ms, reported_connections)."""
+        s = self.s
+        t0 = time.monotonic()
+        try:
+            sock = socket.create_connection(b.addr, timeout=s.health_timeout)
+        except OSError:
+            return False, None, None
+        connect_ms = (time.monotonic() - t0) * 1000
+        try:
+            sock.settimeout(s.health_timeout)
+            sock.sendall(s.health_cmd)
+            data = sock.recv(4096)
+            if data:
+                return True, (time.monotonic() - t0) * 1000, parse_reported(data)
+        except (socket.timeout, OSError):
+            pass
+        finally:
+            sock.close()
+        # connected but no status reply
+        return (not s.require_status_reply), connect_ms, None
+
+    def start(self):
+        for b in self.bal.backends:
+            t = threading.Thread(target=self._loop, args=(b,), daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _loop(self, b):
+        while not self._stop.wait(self.s.health_interval):
+            ok, rtt, rep = self.probe(b)
+            self.bal.health_result(b, ok, rtt, rep)
+
+    def stop(self):
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
+# network interface monitor
+# ---------------------------------------------------------------------------
+def read_proc_net_dev(path="/proc/net/dev"):
+    out = {}
+    with open(path) as f:
+        for line in f.readlines()[2:]:
+            name, data = line.split(":", 1)
+            cols = data.split()
+            out[name.strip()] = (int(cols[0]), int(cols[8]))   # rx bytes, tx bytes
+    return out
+
+
+class NetMonitor:
+    def __init__(self, iface="auto", link_mbps=10.0):
+        self.iface_cfg, self.link_bps = iface, link_mbps * 1e6
+        self.iface = None
+        self.rx_bps = self.tx_bps = self.util = 0.0
+        self.available = True
+        self._last = None
+        self._last_t = None
+
+    def _pick(self, counters):
+        if self.iface_cfg != "auto":
+            return self.iface_cfg if self.iface_cfg in counters else None
+        names = [n for n in counters if n != "lo"]
+        for n in names:                       # Mininet host interface, e.g. lb-eth0
+            if n.endswith("-eth0"):
+                return n
+        return names[0] if names else None
+
+    def sample(self):
+        try:
+            counters = read_proc_net_dev()
+        except (OSError, ValueError, IndexError):
+            self.available = False
+            return
+        if self.iface is None:
+            self.iface = self._pick(counters)
+        if self.iface not in counters:
+            self.available = False
+            return
+        now, cur = time.monotonic(), counters[self.iface]
+        if self._last is not None:
+            dt = max(now - self._last_t, 1e-6)
+            self.rx_bps = (cur[0] - self._last[0]) * 8 / dt
+            self.tx_bps = (cur[1] - self._last[1]) * 8 / dt
+            self.util = clamp01(max(self.rx_bps, self.tx_bps) / self.link_bps)
+        self._last, self._last_t = cur, now
+
+
+# ---------------------------------------------------------------------------
+# controller notification
+# ---------------------------------------------------------------------------
+class ControllerNotifier:
+    def __init__(self, addr, lb_ip):
+        self.addr, self.lb_ip = addr, lb_ip
+        self.sent = self.errors = 0
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if addr else None
+
+    def notify(self, mode, client, backend):
+        if not self._sock:
+            return
+        msg = {"type": "backend_selected", "ts": time.time(), "mode": mode,
+               "lb_ip": self.lb_ip, "client_ip": client[0], "client_port": client[1],
+               "backend": backend.name, "backend_ip": backend.host,
+               "backend_port": backend.port}
+        try:
+            self._sock.sendto((json.dumps(msg) + "\n").encode(), self.addr)
+            self.sent += 1
+        except OSError:                    # controller down must never break traffic
+            self.errors += 1
+
+
+# ---------------------------------------------------------------------------
+# the proxy
+# ---------------------------------------------------------------------------
+class LoadBalancer:
+    def __init__(self, listen, backends, settings):
+        self.s = settings
+        self.listen_addr = listen
+        prefix = os.path.join(settings.log_dir, "lb_%s_%s_" % (settings.mode, settings.run_id))
+        names = [b.name for b in backends]
+        self.events = CsvLog(prefix + "events.csv", ["timestamp", "event", "server", "detail"])
+        dec_head = ["timestamp", "mode", "client", "chosen", "attempt", "reason", "overloaded"]
+        for n in names:
+            dec_head += [n + "_active", n + "_reserved", n + "_state", n + "_score"]
+        self.decisions = CsvLog(prefix + "decisions.csv", dec_head)
+        self.requests = CsvLog(prefix + "requests.csv",
+                               ["timestamp", "client", "server", "attempts", "connect_ms",
+                                "ttfb_ms", "duration_ms", "bytes_up", "bytes_down", "outcome"])
+        net_head = ["timestamp", "iface", "rx_bps", "tx_bps", "link_util"]
+        for n in names:
+            net_head += [n + "_rate_bps", n + "_active", n + "_state"]
+        self.netlog = CsvLog(prefix + "network_load.csv", net_head)
+
+        self.bal = Balancer(backends, settings, self.events)
+        self.health = HealthChecker(self.bal, settings)
+        self.net = NetMonitor(settings.iface, settings.link_mbps)
+        self.notifier = ControllerNotifier(settings.controller, settings.lb_ip)
+        self._stop = threading.Event()
+        self._listener = None
+        self.port = None
+
+    # -- lifecycle -------------------------------------------------------
+    def start(self):
+        for b in self.bal.backends:                  # know who is alive first
+            ok, rtt, rep = self.health.probe(b)
+            self.bal.initial_state(b, ok, rtt, rep)
+        self.health.start()
+        self.net.sample()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(self.listen_addr)
+        self._listener.listen(1024)
+        self.port = self._listener.getsockname()[1]
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        self.events.row(time.time(), "start", "", "mode=%s listen=%s:%d"
+                        % (self.s.mode, self.listen_addr[0], self.port))
+        return self
+
+    def stop(self):
+        self._stop.set()
+        self.health.stop()
+        if self._listener:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+        self.events.row(time.time(), "stop", "", "")
+        for log in (self.events, self.decisions, self.requests, self.netlog):
+            log.close()
+
+    # -- loops ------------------------------------------------------------
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                client, addr = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(client, addr), daemon=True).start()
+
+    def _monitor_loop(self):
+        last = time.monotonic()
+        while not self._stop.wait(1.0):
+            now = time.monotonic()
+            dt, last = now - last, now
+            self.net.sample()
+            self.bal.sample_rates(dt)
+            row = [time.time(), self.net.iface or "", round(self.net.rx_bps), round(self.net.tx_bps),
+                   round(self.net.util, 4)]
+            with self.bal.lock:
+                for b in self.bal.backends:
+                    row += [round(b.rate_bps), b.active, b.state]
+            self.netlog.row(*row)
+
+    # -- one client connection --------------------------------------------
+    def _handle(self, client, addr):
+        s = self.s
+        t_start = time.time()
+        t_mono = time.monotonic()
+        backend = upstream = None
+        attempts, tried = 0, []
+        outcome, connect_ms, res = "no_backend", None, {}
+        try:
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            while attempts < s.max_attempts:
+                attempts += 1
+                b, info = self.bal.choose(exclude=tried)
+                if b is None:
+                    outcome = "no_backend"
+                    break
+                self._log_decision(t_start, addr, b, attempts, info)
+                self.notifier.notify(s.mode, addr, b)
+                t0 = time.monotonic()
+                try:
+                    up = socket.create_connection(b.addr, timeout=s.connect_timeout)
+                except OSError as exc:
+                    self.bal.connect_failed(b, exc)
+                    tried.append(b.name)
+                    outcome = "connect_failed"
+                    continue
+                up.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                connect_ms = (time.monotonic() - t0) * 1000
+                self.bal.connected(b)
+                backend, upstream = b, up
+                break
+            if backend is not None:
+                res = self._relay(client, upstream, backend)
+                outcome = res["outcome"]
+        except Exception as exc:            # never let one connection kill a thread silently
+            outcome = "lb_error:%s" % type(exc).__name__
+        finally:
+            for sock in (upstream, client):
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+            if backend is not None:
+                self.bal.finished(backend, res.get("ttfb_ms"),
+                                  error=outcome not in ("ok", "empty"))
+            self.requests.row(
+                t_start, "%s:%d" % addr[:2], backend.name if backend else "", attempts,
+                _r(connect_ms), _r(res.get("ttfb_ms")), _r((time.monotonic() - t_mono) * 1000),
+                res.get("up", 0), res.get("down", 0), outcome)
+
+    def _log_decision(self, ts, client, b, attempt, info):
+        row = [ts, self.s.mode, "%s:%d" % client[:2], b.name, attempt, info["reason"],
+               info.get("overloaded", "")]
+        for d in info["snapshot"]:
+            row += [d["active"], d["reserved"], d["state"], d["score"]]
+        self.decisions.row(*row)
+
+    def _relay(self, client, upstream, b):
+        """Copy bytes both ways until both sides are done. Handles half-close."""
+        sel = selectors.DefaultSelector()
+        sel.register(client, selectors.EVENT_READ, upstream)
+        sel.register(upstream, selectors.EVENT_READ, client)
+        up = down = 0
+        first_up = ttfb = outcome = None
+        last = time.monotonic()
+        try:
+            while sel.get_map() and outcome is None:
+                events = sel.select(timeout=1.0)
+                if not events:
+                    if time.monotonic() - last > self.s.idle_timeout:
+                        outcome = "idle_timeout"
+                    continue
+                for key, _ in events:
+                    src, dst = key.fileobj, key.data
+                    try:
+                        data = src.recv(65536)
+                    except OSError:
+                        outcome = "backend_reset" if src is upstream else "client_reset"
+                        break
+                    if not data:                       # EOF: pass the half-close on
+                        sel.unregister(src)
+                        try:
+                            dst.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        continue
+                    now = time.monotonic()
+                    last = now
+                    try:
+                        dst.sendall(data)
+                    except OSError:
+                        outcome = "backend_reset" if dst is upstream else "client_reset"
+                        break
+                    self.bal.add_bytes(b, len(data))
+                    if src is client:
+                        up += len(data)
+                        if first_up is None:
+                            first_up = now
+                    else:
+                        down += len(data)
+                        if ttfb is None and first_up is not None:
+                            ttfb = (now - first_up) * 1000
+        finally:
+            sel.close()
+        if outcome is None:
+            outcome = "ok" if down > 0 else ("no_response" if up > 0 else "empty")
+        return dict(outcome=outcome, ttfb_ms=ttfb, up=up, down=down)
+
+    # -- console status ------------------------------------------------------
+    def status_line(self):
+        with self.bal.lock:
+            parts = ["%s[%s%s a=%d r=%d sc=%.2f %.0fKB/s]" % (
+                b.name, b.state, "/OVL" if b.overloaded else "", b.active, b.reserved,
+                self.bal.score(b), b.rate_bps / 1000.0) for b in self.bal.backends]
+        net = ("%s %.1f%%" % (self.net.iface, self.net.util * 100)) if self.net.available else "n/a"
+        return "[%s] mode=%s net=%s | %s" % (time.strftime("%H:%M:%S"), self.s.mode, net, "  ".join(parts))
+
+
+def _r(v):
+    return "" if v is None else round(v, 2)
+
+
+# ---------------------------------------------------------------------------
+# command line
+# ---------------------------------------------------------------------------
+def _hostport(text):
+    host, port = text.rsplit(":", 1)
+    return host, int(port)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Adaptive TCP load balancer (Person 4)")
+    ap.add_argument("--mode", choices=["static", "adaptive"], default="adaptive")
+    ap.add_argument("--listen", default="0.0.0.0:5000", help="host:port clients connect to")
+    ap.add_argument("--backends", default=DEFAULT_BACKENDS, help="name=ip:port,...")
+    ap.add_argument("--controller", default="none",
+                    help="host:port of the SDN controller (UDP JSON), or 'none'")
+    ap.add_argument("--lb-ip", default="10.0.0.4")
+    ap.add_argument("--health-interval", type=float, default=1.0)
+    ap.add_argument("--health-timeout", type=float, default=1.0)
+    ap.add_argument("--down-after", type=int, default=3, help="failed probes before down")
+    ap.add_argument("--up-after", type=int, default=2, help="good probes before up")
+    ap.add_argument("--health-cmd", default="STATUS", help="line sent for health checks")
+    ap.add_argument("--require-status-reply", action="store_true",
+                    help="treat a server that accepts but never replies as down")
+    ap.add_argument("--overload-conns", type=int, default=40)
+    ap.add_argument("--score-high", type=float, default=0.80)
+    ap.add_argument("--score-low", type=float, default=0.60)
+    ap.add_argument("--conn-cap", type=float, default=30.0)
+    ap.add_argument("--weights", default="0.35,0.25,0.20,0.20",
+                    help="conns,latency,traffic,health (must sum to 1)")
+    ap.add_argument("--iface", default="auto", help="interface to monitor, e.g. lb-eth0")
+    ap.add_argument("--link-mbps", type=float, default=10.0)
+    ap.add_argument("--idle-timeout", type=float, default=30.0)
+    ap.add_argument("--log-dir", default="logs")
+    ap.add_argument("--run-id", default=time.strftime("%Y%m%d-%H%M%S"))
+    ap.add_argument("--status-interval", type=float, default=5.0, help="0 disables")
+    a = ap.parse_args(argv)
+
+    w = [float(x) for x in a.weights.split(",")]
+    if len(w) != 4 or abs(sum(w) - 1.0) > 1e-6:
+        ap.error("--weights needs four numbers that sum to 1")
+    st = Settings(
+        mode=a.mode, weights=dict(zip(["conns", "latency", "traffic", "health"], w)),
+        overload_conns=a.overload_conns, score_high=a.score_high, score_low=a.score_low,
+        conn_cap=a.conn_cap, health_interval=a.health_interval,
+        health_timeout=a.health_timeout, down_after=a.down_after, up_after=a.up_after,
+        health_cmd=(a.health_cmd + "\n").encode(), require_status_reply=a.require_status_reply,
+        iface=a.iface, link_mbps=a.link_mbps, idle_timeout=a.idle_timeout, lb_ip=a.lb_ip,
+        log_dir=a.log_dir, run_id=a.run_id,
+        controller=None if a.controller.lower() == "none" else _hostport(a.controller))
+
+    if resource is not None:                         # many concurrent clients -> many fds
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard if hard > 0 else soft, hard))
+        except (ValueError, OSError):
+            pass
+
+    lb = LoadBalancer(_hostport(a.listen), parse_backends(a.backends), st).start()
+    print("Load balancer listening on %s:%d  mode=%s  logs=%s/lb_%s_%s_*.csv"
+          % (a.listen.rsplit(":", 1)[0], lb.port, a.mode, a.log_dir, a.mode, a.run_id))
+    print("Backends:", ", ".join("%s=%s:%d(%s)" % (b.name, b.host, b.port, b.state)
+                                 for b in lb.bal.backends))
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        while True:
+            time.sleep(a.status_interval if a.status_interval > 0 else 3600)
+            if a.status_interval > 0:
+                print(lb.status_line(), flush=True)
+    except KeyboardInterrupt:
+        print("\nstopping...")
+    finally:
+        lb.stop()
+
+
+if __name__ == "__main__":
+    main()
