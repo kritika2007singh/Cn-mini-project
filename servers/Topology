@@ -1,0 +1,163 @@
+
+#!/usr/bin/env python3
+
+# Import Mininet tools
+
+from mininet.net import Mininet
+from mininet.node import RemoteController, OVSSwitch
+from mininet.link import TCLink
+from mininet.cli import CLI
+from mininet.log import setLogLevel, info
+
+
+def create_network():
+
+    # --------------------------------------------------
+    # 1. CREATE THE MININET NETWORK
+    # --------------------------------------------------
+
+    info("\n*** Creating Mininet network\n")
+
+    net = Mininet(
+        controller=None,
+        switch=OVSSwitch,
+        link=TCLink,
+        autoSetMacs=True
+    )
+
+    # --------------------------------------------------
+    # 2. CONNECT TO THE RYU CONTROLLER
+    # --------------------------------------------------
+
+    info("*** Connecting to Ryu controller\n")
+
+    net.addController(
+        "c0",
+        controller=RemoteController,
+        ip="127.0.0.1",
+        port=6653
+    )
+
+    # --------------------------------------------------
+    # 3. CREATE THE OPEN vSWITCH
+    # --------------------------------------------------
+
+    info("*** Creating Open vSwitch s1\n")
+
+    s1 = net.addSwitch(
+        "s1",
+        protocols="OpenFlow13"
+    )
+
+    # --------------------------------------------------
+    # 4. CREATE THE CLIENT HOSTS
+    # --------------------------------------------------
+
+    info("*** Creating client hosts\n")
+
+    c1 = net.addHost(
+        "c1",
+        ip="10.0.0.1/24"
+    )
+
+    c2 = net.addHost(
+        "c2",
+        ip="10.0.0.2/24"
+    )
+
+    # --------------------------------------------------
+    # 5. CREATE THE INTERNAL LOAD BALANCER HOST
+    # --------------------------------------------------
+
+    info("*** Creating internal load balancer host\n")
+
+    lb = net.addHost(
+        "lb",
+        ip="10.0.0.4/24"
+    )
+
+    # --------------------------------------------------
+    # 6. CREATE THE BACKEND SERVERS
+    # --------------------------------------------------
+
+    info("*** Creating backend servers\n")
+
+    server1 = net.addHost(
+        "server1",
+        ip="10.0.0.11/24"
+    )
+
+    server2 = net.addHost(
+        "server2",
+        ip="10.0.0.12/24"
+    )
+
+    server3 = net.addHost(
+        "server3",
+        ip="10.0.0.13/24"
+    )
+
+    # --------------------------------------------------
+    # 7. CONNECT ALL HOSTS TO THE SWITCH
+    # --------------------------------------------------
+
+    info("*** Connecting hosts to s1\n")
+
+    net.addLink(c1, s1, bw=10)
+    net.addLink(c2, s1, bw=10)
+    net.addLink(lb, s1, bw=10)
+
+    net.addLink(server1, s1, bw=10)
+    net.addLink(server2, s1, bw=10)
+    net.addLink(server3, s1, bw=10)
+
+    # --------------------------------------------------
+    # 8. START THE NETWORK
+    # --------------------------------------------------
+
+    info("*** Starting network\n")
+
+    net.start()
+
+    # --------------------------------------------------
+    # 9. DISPLAY HOST INFORMATION
+    # --------------------------------------------------
+
+    info("\n*** Network started successfully\n")
+
+    info("*** Host information:\n")
+
+    for host in net.hosts:
+
+        info(
+            "{} : {}\n".format(
+                host.name,
+                host.IP()
+            )
+        )
+
+    info("*** Switch: s1\n")
+    info("*** Controller: 127.0.0.1:6653\n")
+
+    # --------------------------------------------------
+    # 10. OPEN THE MININET COMMAND LINE
+    # --------------------------------------------------
+
+    CLI(net)
+
+    # --------------------------------------------------
+    # 11. STOP THE NETWORK WHEN EXITING
+    # --------------------------------------------------
+
+    net.stop()
+
+
+# ------------------------------------------------------
+# PROGRAM ENTRY POINT
+# ------------------------------------------------------
+
+if __name__ == "__main__":
+
+    setLogLevel("info")
+
+    create_network()
